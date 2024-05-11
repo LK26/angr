@@ -8,7 +8,6 @@ import re
 import unittest
 from functools import wraps
 
-from typing import List, Tuple
 import ailment
 
 import angr
@@ -22,7 +21,13 @@ from angr.analyses import (
     Decompiler,
 )
 from angr.analyses.decompiler.optimization_passes.expr_op_swapper import OpDescriptor
-from angr.analyses.decompiler.optimization_passes import DUPLICATING_OPTS, LoweredSwitchSimplifier
+from angr.analyses.decompiler.optimization_passes import (
+    DUPLICATING_OPTS,
+    LoweredSwitchSimplifier,
+    InlinedStringTransformationSimplifier,
+    ReturnDuplicatorLow,
+    ReturnDuplicatorHigh,
+)
 from angr.analyses.decompiler.decompilation_options import get_structurer_option, PARAM_TO_OPTION
 from angr.analyses.decompiler.structuring import STRUCTURER_CLASSES
 from angr.analyses.decompiler.structuring.phoenix import MultiStmtExprMode
@@ -41,7 +46,7 @@ WORKER = is_testing or bool(
 )  # this variable controls whether we print the decompilation code or not
 
 
-def set_decompiler_option(decompiler_options: List[Tuple], params: List[Tuple]) -> List[Tuple]:
+def set_decompiler_option(decompiler_options: list[tuple], params: list[tuple]) -> list[tuple]:
     if decompiler_options is None:
         decompiler_options = []
 
@@ -106,13 +111,19 @@ class TestDecompiler(unittest.TestCase):
 
         cfg = p.analyses[CFGFast].prep()(data_references=True, normalize=True)
         for f in cfg.functions.values():
-            if f.is_simprocedure:
+            if f.is_simprocedure or f.is_plt or f.is_syscall or f.is_alignment:
                 l.debug("Skipping SimProcedure %s.", repr(f))
                 continue
-            p.analyses[Decompiler].prep()(f, cfg=cfg.model, options=decompiler_options)
-            # FIXME: This test does not pass
-            # assert dec.codegen is not None, "Failed to decompile function %s." % repr(f)
-            # self._print_decompilation_result(dec)
+            dec = p.analyses[Decompiler].prep()(f, cfg=cfg.model, options=decompiler_options)
+
+            if dec.codegen is not None and f.name not in {
+                "deregister_tm_clones",
+                "register_tm_clones",
+                "frame_dummy",
+                "__libc_csu_init",
+            }:
+                self._print_decompilation_result(dec)
+                assert "(true)" not in dec.codegen.text and "(false)" not in dec.codegen.text
 
     @for_all_structuring_algos
     def test_decompiling_babypwn_i386(self, decompiler_options=None):
@@ -3391,7 +3402,15 @@ class TestDecompiler(unittest.TestCase):
         cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
         proj.analyses.CompleteCallingConventions(cfg=cfg, recover_variables=True)
         f = proj.kb.functions[0x140005234]
-        d = proj.analyses[Decompiler].prep()(f, cfg=cfg.model, options=decompiler_options)
+
+        # disable string obfuscation removal
+        all_optimization_passes = angr.analyses.decompiler.optimization_passes.get_default_optimization_passes(
+            "AMD64", "linux", disable_opts={InlinedStringTransformationSimplifier}
+        )
+
+        d = proj.analyses[Decompiler].prep()(
+            f, cfg=cfg.model, options=decompiler_options, optimization_passes=all_optimization_passes
+        )
 
         self._print_decompilation_result(d)
         text = d.codegen.text
@@ -3409,7 +3428,7 @@ class TestDecompiler(unittest.TestCase):
             text,
         )
         m1 = re.search(
-            r"\(&v\d+\)\[v\d+] = \(&v\d+\)\[v\d+] \^ \(unsigned short\)\(145 \+ \(unsigned int\)v32\);", text
+            r"\(&v\d+\)\[v\d+] = \(&v\d+\)\[v\d+] \^ \(unsigned short\)\(145 \+ \(unsigned int\)v\d+\);", text
         )
         assert m0 is not None or m1 is not None
 
@@ -3440,6 +3459,7 @@ class TestDecompiler(unittest.TestCase):
         # should not crash!
         assert text.count("407710288") == 1 or text.count("0x184d2a50") == 1
 
+    @structuring_algo("phoenix")
     def test_hostname_bad_mem_read(self, decompiler_options=None):
         bin_path = os.path.join(test_location, "x86_64", "decompiler", "hostname")
         proj = angr.Project(bin_path, auto_load_libs=False)
@@ -3449,6 +3469,66 @@ class TestDecompiler(unittest.TestCase):
         d = proj.analyses[Decompiler].prep()(f, cfg=cfg.model, options=decompiler_options)
 
         assert d.codegen is not None
+
+    @structuring_algo("phoenix")
+    def test_incorrect_function_argument_unification(self, decompiler_options=None):
+        bin_path = os.path.join(test_location, "x86_64", "liblzma.so.5.6.1")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True)
+        f = proj.kb.functions[0x40D450]
+        d = proj.analyses[Decompiler].prep()(f, cfg=cfg.model, options=decompiler_options)
+        self._print_decompilation_result(d)
+        text = d.codegen.text
+        # should not simplify away the bitwise-or operation
+        assert text.count(" |= ") == 1
+
+    @structuring_algo("phoenix")
+    def test_simplifying_string_transformation_loops(self, decompiler_options=None):
+        bin_path = os.path.join(test_location, "x86_64", "windows", "cancel.sys")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+        f = proj.kb.functions[0x140005234]
+        d = proj.analyses[Decompiler].prep()(f, cfg=cfg.model, options=decompiler_options)
+        self._print_decompilation_result(d)
+
+        assert d.codegen is not None
+        assert "IoDriverObjectType" in d.codegen.text
+        assert "wstrncpy(" in d.codegen.text
+        assert "ObMakeTemporaryObject" in d.codegen.text
+
+    @structuring_algo("phoenix")
+    def test_ite_region_converter_missing_break_statement(self, decompiler_options=None):
+        # https://github.com/angr/angr/issues/4574
+        bin_path = os.path.join(test_location, "x86_64", "ite_region_converter_missing_breaks")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+        f = proj.kb.functions["authenticate"]
+
+        # disable return duplicator
+        all_optimization_passes = angr.analyses.decompiler.optimization_passes.get_default_optimization_passes(
+            "AMD64", "linux", disable_opts={ReturnDuplicatorLow, ReturnDuplicatorHigh}
+        )
+
+        d = proj.analyses[Decompiler].prep()(
+            f, cfg=cfg.model, options=decompiler_options, optimization_passes=all_optimization_passes
+        )
+        self._print_decompilation_result(d)
+
+        assert d.codegen.text.count("break;") == 2
+
+    @structuring_algo("phoenix")
+    def test_ternary_expression_over_propagation(self, decompiler_options=None):
+        # https://github.com/angr/angr/issues/4573
+        bin_path = os.path.join(test_location, "x86_64", "ite_region_converter_missing_breaks")
+        proj = angr.Project(bin_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast(normalize=True, data_references=True)
+        f = proj.kb.functions["authenticate"]
+        d = proj.analyses[Decompiler].prep()(f, cfg=cfg.model, options=decompiler_options)
+        self._print_decompilation_result(d)
+
+        # the ITE expression should not be propagated into the dst of an assignment
+        # the original assignment (rax = memcmp(xxx)? 0, 1) should be removed as well
+        assert d.codegen.text.count('"Welcome to the admin console, trusted user!"') == 1
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from itertools import chain
-from typing import Optional, Iterable, Set, Union, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
+from collections.abc import Iterable
 import logging
 
 import pyvex
@@ -176,6 +177,9 @@ class SimEngineRDVEX(
             return
         self.state.kill_and_add_definition(reg, data)
 
+    def _handle_PutI(self, stmt):
+        pass
+
     # e.g. STle(t6) = t21, t6 and/or t21 might include multiple values
     def _handle_Store(self, stmt):
         addr = self._expr(stmt.addr)
@@ -213,10 +217,10 @@ class SimEngineRDVEX(
 
     def _store_core(
         self,
-        addr: Iterable[Union[int, claripy.ast.bv.BV]],
+        addr: Iterable[int | claripy.ast.bv.BV],
         size: int,
         data: MultiValues,
-        data_old: Optional[MultiValues] = None,
+        data_old: MultiValues | None = None,
         endness=None,
     ):
         if data_old is not None:
@@ -226,7 +230,7 @@ class SimEngineRDVEX(
             if self.state.is_top(a):
                 l.debug("Memory address undefined, ins_addr = %#x.", self.ins_addr)
             else:
-                tags: Optional[Set[Tag]]
+                tags: set[Tag] | None
                 if isinstance(a, int):
                     atom = MemoryLocation(a, size)
                     tags = None
@@ -358,7 +362,7 @@ class SimEngineRDVEX(
             data = MultiValues(top)
         return data
 
-    def _handle_RdTmp(self, expr: pyvex.IRExpr.RdTmp) -> Optional[MultiValues]:
+    def _handle_RdTmp(self, expr: pyvex.IRExpr.RdTmp) -> MultiValues | None:
         tmp: int = expr.tmp
 
         self.state.add_tmp_use(tmp)
@@ -384,7 +388,7 @@ class SimEngineRDVEX(
             # write it to registers
             self.state.kill_and_add_definition(reg_atom, values, override_codeloc=self._external_codeloc())
 
-        current_defs: Optional[Iterable[Definition]] = None
+        current_defs: Iterable[Definition] | None = None
         for vs in values.values():
             for v in vs:
                 if current_defs is None:
@@ -403,6 +407,9 @@ class SimEngineRDVEX(
         self.state.add_register_use_by_defs(current_defs)
 
         return values
+
+    def _handle_GetI(self, expr: pyvex.IRExpr.GetI) -> MultiValues:
+        return MultiValues(self.state.top(expr.result_size(self.tyenv)))
 
     # e.g. t27 = LDle:I64(t9), t9 might include multiple values
     # caution: Is also called from StoreG
@@ -426,7 +433,7 @@ class SimEngineRDVEX(
         return MultiValues(top)
 
     def _load_core(self, addrs: Iterable[claripy.ast.Base], size: int, endness: str) -> MultiValues:
-        result: Optional[MultiValues] = None
+        result: MultiValues | None = None
         # we may get more than one stack addrs with the same value but different annotations (because they are defined
         # at different locations). only load them once.
         loaded_stack_offsets = set()
@@ -1074,7 +1081,7 @@ class SimEngineRDVEX(
     # User defined high level statement handlers
     #
 
-    def _handle_function(self, func_addr: Optional[MultiValues]):
+    def _handle_function(self, func_addr: MultiValues | None):
         if func_addr is None:
             func_addr = self.state.top(self.state.arch.bits)
 

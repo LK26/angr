@@ -3,7 +3,8 @@ from collections import defaultdict, namedtuple
 import logging
 import enum
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Set, Optional, Iterable, Union, Type, Any, NamedTuple, TYPE_CHECKING
+from typing import Optional, Any, NamedTuple, TYPE_CHECKING
+from collections.abc import Iterable
 
 import networkx
 import capstone
@@ -33,6 +34,7 @@ from ...procedures.stubs.UnresolvableJumpTarget import UnresolvableJumpTarget
 from .. import Analysis, register_analysis
 from ..cfg.cfg_base import CFGBase
 from ..reaching_definitions import ReachingDefinitionsAnalysis
+from .return_maker import ReturnMaker
 from .ailgraph_walker import AILGraphWalker, RemoveNodeNotice
 from .optimization_passes import (
     get_default_optimization_passes,
@@ -91,10 +93,10 @@ class Clinic(Analysis):
         insert_labels=True,
         optimization_passes=None,
         cfg=None,
-        peephole_optimizations: Optional[
-            Iterable[Union[Type["PeepholeOptimizationStmtBase"], Type["PeepholeOptimizationExprBase"]]]
-        ] = None,  # pylint:disable=line-too-long
-        must_struct: Optional[Set[str]] = None,
+        peephole_optimizations: None | (
+            Iterable[type["PeepholeOptimizationStmtBase"] | type["PeepholeOptimizationExprBase"]]
+        ) = None,  # pylint:disable=line-too-long
+        must_struct: set[str] | None = None,
         variable_kb=None,
         reset_variable_names=False,
         rewrite_ites_to_diamonds=True,
@@ -107,14 +109,14 @@ class Clinic(Analysis):
         self.function = func
 
         self.graph = None
-        self.cc_graph: Optional[networkx.DiGraph] = None
-        self.unoptimized_graph: Optional[networkx.DiGraph] = None
+        self.cc_graph: networkx.DiGraph | None = None
+        self.unoptimized_graph: networkx.DiGraph | None = None
         self.arg_list = None
         self.variable_kb = variable_kb
-        self.externs: Set[SimMemoryVariable] = set()
-        self.data_refs: Dict[int, int] = {}  # data address to instruction address
+        self.externs: set[SimMemoryVariable] = set()
+        self.data_refs: dict[int, int] = {}  # data address to instruction address
 
-        self._func_graph: Optional[networkx.DiGraph] = None
+        self._func_graph: networkx.DiGraph | None = None
         self._ail_manager = None
         self._blocks_by_addr_and_size = {}
 
@@ -128,7 +130,7 @@ class Clinic(Analysis):
         self._must_struct = must_struct
         self._reset_variable_names = reset_variable_names
         self._rewrite_ites_to_diamonds = rewrite_ites_to_diamonds
-        self.reaching_definitions: Optional[ReachingDefinitionsAnalysis] = None
+        self.reaching_definitions: ReachingDefinitionsAnalysis | None = None
         self._cache = cache
         self._mode = mode
 
@@ -261,7 +263,7 @@ class Clinic(Analysis):
         )
 
         # cached block-level reaching definition analysis results and propagator results
-        block_simplification_cache: Optional[Dict[ailment.Block, NamedTuple]] = {}
+        block_simplification_cache: dict[ailment.Block, NamedTuple] | None = {}
 
         # Simplify blocks
         # we never remove dead memory definitions before making callsites. otherwise stack arguments may go missing
@@ -419,7 +421,7 @@ class Clinic(Analysis):
         )
 
         # cached block-level reaching definition analysis results and propagator results
-        block_simplification_cache: Optional[Dict[ailment.Block, NamedTuple]] = {}
+        block_simplification_cache: dict[ailment.Block, NamedTuple] | None = {}
 
         # Simplify blocks
         # we never remove dead memory definitions before making callsites. otherwise stack arguments may go missing
@@ -448,7 +450,7 @@ class Clinic(Analysis):
         self.variable_kb = None
         self.cc_graph = None
         self.externs = None
-        self.data_refs: Dict[int, List[DataRefDesc]] = self._collect_data_refs(ail_graph)
+        self.data_refs: dict[int, list[DataRefDesc]] = self._collect_data_refs(ail_graph)
 
     @staticmethod
     def _copy_graph(graph: networkx.DiGraph) -> networkx.DiGraph:
@@ -779,7 +781,7 @@ class Clinic(Analysis):
         ail_graph: networkx.DiGraph,
         remove_dead_memdefs=False,
         stack_pointer_tracker=None,
-        cache: Optional[Dict[ailment.Block, NamedTuple]] = None,
+        cache: dict[ailment.Block, NamedTuple] | None = None,
     ):
         """
         Simplify all blocks in self._blocks.
@@ -791,7 +793,7 @@ class Clinic(Analysis):
         :return:                        None
         """
 
-        blocks_by_addr_and_idx: Dict[Tuple[int, Optional[int]], ailment.Block] = {}
+        blocks_by_addr_and_idx: dict[tuple[int, int | None], ailment.Block] = {}
 
         for ail_block in ail_graph.nodes():
             simplified = self._simplify_block(
@@ -922,8 +924,8 @@ class Clinic(Analysis):
         variable_kb=None,
         **kwargs,
     ):
-        addr_and_idx_to_blocks: Dict[Tuple[int, Optional[int]], ailment.Block] = {}
-        addr_to_blocks: Dict[int, Set[ailment.Block]] = defaultdict(set)
+        addr_and_idx_to_blocks: dict[tuple[int, int | None], ailment.Block] = {}
+        addr_to_blocks: dict[int, set[ailment.Block]] = defaultdict(set)
 
         # update blocks_map to allow node_addr to node lookup
         def _updatedict_handler(node):
@@ -962,10 +964,10 @@ class Clinic(Analysis):
         return ail_graph
 
     @timethis
-    def _make_argument_list(self) -> List[SimVariable]:
+    def _make_argument_list(self) -> list[SimVariable]:
         if self.function.calling_convention is not None and self.function.prototype is not None:
-            args: List[SimFunctionArgument] = self.function.calling_convention.arg_locs(self.function.prototype)
-            arg_vars: List[SimVariable] = []
+            args: list[SimFunctionArgument] = self.function.calling_convention.arg_locs(self.function.prototype)
+            arg_vars: list[SimVariable] = []
             if args:
                 arg_names = self.function.prototype.arg_names or [f"a{i}" for i in range(len(args))]
                 for idx, arg in enumerate(args):
@@ -1054,51 +1056,12 @@ class Clinic(Analysis):
             # unknown calling convention. cannot do much about return expressions.
             return ail_graph
 
-        # Block walker
-
-        def _handle_Return(
-            stmt_idx: int, stmt: ailment.Stmt.Return, block: Optional[ailment.Block]
-        ):  # pylint:disable=unused-argument
-            if (
-                block is not None
-                and not stmt.ret_exprs
-                and self.function.prototype is not None
-                and self.function.prototype.returnty is not None
-                and type(self.function.prototype.returnty) is not SimTypeBottom
-            ):
-                new_stmt = stmt.copy()
-                ret_val = self.function.calling_convention.return_val(self.function.prototype.returnty)
-                if isinstance(ret_val, SimRegArg):
-                    reg = self.project.arch.registers[ret_val.reg_name]
-                    new_stmt.ret_exprs.append(
-                        ailment.Expr.Register(
-                            self._next_atom(),
-                            None,
-                            reg[0],
-                            ret_val.size * self.project.arch.byte_width,
-                            reg_name=self.project.arch.translate_register_name(reg[0], ret_val.size),
-                        )
-                    )
-                else:
-                    l.warning("Unsupported type of return expression %s.", type(ret_val))
-                block.statements[stmt_idx] = new_stmt
-
-        def _handler(block):
-            walker = ailment.AILBlockWalker()
-            # we don't need to handle any statement besides Returns
-            walker.stmt_handlers.clear()
-            walker.expr_handlers.clear()
-            walker.stmt_handlers[ailment.Stmt.Return] = _handle_Return
-            walker.walk(block)
-
-        # Graph walker
-
-        AILGraphWalker(ail_graph, _handler, replace_nodes=True).walk()
+        ReturnMaker(self._ail_manager, self.project.arch, self.function, ail_graph)
 
         return ail_graph
 
     @timethis
-    def _make_function_prototype(self, arg_list: List[SimVariable], variable_kb):
+    def _make_function_prototype(self, arg_list: list[SimVariable], variable_kb):
         if self.function.prototype is not None:
             if not self.function.is_prototype_guessed:
                 # do not overwrite an existing function prototype
@@ -1605,7 +1568,7 @@ class Clinic(Analysis):
 
     @staticmethod
     def _remove_redundant_jump_blocks(ail_graph):
-        def first_conditional_jump(block: ailment.Block) -> Optional[ailment.Stmt.ConditionalJump]:
+        def first_conditional_jump(block: ailment.Block) -> ailment.Stmt.ConditionalJump | None:
             for stmt in block.statements:
                 if isinstance(stmt, ailment.Stmt.ConditionalJump):
                     return stmt
@@ -1671,7 +1634,7 @@ class Clinic(Analysis):
             expr: ailment.expression.Expression,
             stmt_idx: int,
             stmt: ailment.statement.Statement,
-            block: Optional[ailment.Block],
+            block: ailment.Block | None,
         ):
             if expr is None:
                 return None
@@ -1683,7 +1646,7 @@ class Clinic(Analysis):
                     variables.add(v)
             return ailment.AILBlockWalker._handle_expr(walker, expr_idx, expr, stmt_idx, stmt, block)
 
-        def handle_Store(stmt_idx: int, stmt: ailment.statement.Store, block: Optional[ailment.Block]):
+        def handle_Store(stmt_idx: int, stmt: ailment.statement.Store, block: ailment.Block | None):
             if stmt.variable and stmt.variable in global_vars:
                 variables.add(stmt.variable)
             return ailment.AILBlockWalker._handle_Store(walker, stmt_idx, stmt, block)
@@ -1694,17 +1657,17 @@ class Clinic(Analysis):
         return variables
 
     @staticmethod
-    def _collect_data_refs(ail_graph) -> Dict[int, List[DataRefDesc]]:
+    def _collect_data_refs(ail_graph) -> dict[int, list[DataRefDesc]]:
         # pylint:disable=unused-argument
         walker = ailment.AILBlockWalker()
-        data_refs: Dict[int, List[DataRefDesc]] = defaultdict(list)
+        data_refs: dict[int, list[DataRefDesc]] = defaultdict(list)
 
         def handle_Const(
             expr_idx: int,
             expr: ailment.expression.Const,
             stmt_idx: int,
             stmt: ailment.statement.Statement,
-            block: Optional[ailment.Block],
+            block: ailment.Block | None,
         ):
             if isinstance(expr.value, int) and hasattr(expr, "ins_addr"):
                 data_refs[block.addr].append(
@@ -1722,7 +1685,7 @@ class Clinic(Analysis):
             expr: ailment.expression.Load,
             stmt_idx: int,
             stmt: ailment.statement.Statement,
-            block: Optional[ailment.Block],
+            block: ailment.Block | None,
         ):
             if isinstance(expr.addr, ailment.expression.Const):
                 addr = expr.addr
@@ -1752,7 +1715,7 @@ class Clinic(Analysis):
 
             return ailment.AILBlockWalker._handle_Load(walker, expr_idx, expr, stmt_idx, stmt, block)
 
-        def handle_Store(stmt_idx: int, stmt: ailment.statement.Store, block: Optional[ailment.Block]):
+        def handle_Store(stmt_idx: int, stmt: ailment.statement.Store, block: ailment.Block | None):
             if isinstance(stmt.addr, ailment.expression.Const):
                 addr = stmt.addr
                 if isinstance(addr.value, int) and hasattr(addr, "ins_addr"):
@@ -1798,7 +1761,7 @@ class Clinic(Analysis):
         op_type = kwargs.pop("op_type")
         return isinstance(stmt, ailment.Stmt.Call) and op_type == OP_BEFORE
 
-    def parse_variable_addr(self, addr: ailment.Expr.Expression) -> Optional[Tuple[Any, Any]]:
+    def parse_variable_addr(self, addr: ailment.Expr.Expression) -> tuple[Any, Any] | None:
         if isinstance(addr, ailment.Expr.Const):
             return addr, 0
         if isinstance(addr, ailment.Expr.BinaryOp):

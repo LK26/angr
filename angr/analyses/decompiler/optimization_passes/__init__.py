@@ -25,6 +25,7 @@ from .win_stack_canary_simplifier import WinStackCanarySimplifier
 from .cross_jump_reverter import CrossJumpReverter
 from .code_motion import CodeMotionOptimization
 from .switch_default_case_duplicator import SwitchDefaultCaseDuplicator
+from .inlined_string_transformation_simplifier import InlinedStringTransformationSimplifier
 
 # order matters!
 _all_optimization_passes = [
@@ -49,6 +50,7 @@ _all_optimization_passes = [
     (CodeMotionOptimization, True),
     (CrossJumpReverter, True),
     (FlipBooleanCmp, True),
+    (InlinedStringTransformationSimplifier, True),
 ]
 
 # these passes may duplicate code to remove gotos or improve the structure of the graph
@@ -76,9 +78,7 @@ def get_optimization_passes(arch, platform):
     return passes
 
 
-def get_default_optimization_passes(
-    arch: Union[Arch, str], platform: Optional[str], enable_opts=None, disable_opts=None
-):
+def get_default_optimization_passes(arch: Arch | str, platform: str | None, enable_opts=None, disable_opts=None):
     if isinstance(arch, Arch):
         arch = arch.name
 
